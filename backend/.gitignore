@@ -1,0 +1,12 @@
+# Backend - Python FastAPI Server
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+tresorier.db
+.DS_Store
