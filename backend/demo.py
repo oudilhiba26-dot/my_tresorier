@@ -11,10 +11,14 @@ from app.scrapers.carrefour_scraper import CarrefourScraper
 from app.database.models import PriceRecord
 from app.database.connection import init_db, SessionLocal
 import pandas as pd
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def calculate_average_price(prices):
-    """Helper function to calculate average price from a list of PriceData objects"""
+    """Helper function to calculate average price from a list of price objects"""
     if not prices:
         return {"average": 0, "min": 0, "max": 0, "count": 0}
     
@@ -27,40 +31,81 @@ def calculate_average_price(prices):
     }
 
 
+def safe_save_to_db(prices, source_name):
+    """Safely save price records to database"""
+    if not prices:
+        logger.warning(f"No prices to save from {source_name}")
+        return 0
+    
+    db = SessionLocal()
+    saved_count = 0
+    try:
+        for price in prices:
+            # Handle both old and new PriceData formats
+            record = PriceRecord(
+                product_name=price.product_name,
+                price=price.price,
+                currency=getattr(price, 'currency', 'MAD'),
+                unit=getattr(price, 'unit', 'piece'),
+                source=getattr(price, 'source', source_name),
+                product_url=getattr(price, 'product_url', ''),
+                scrape_date=getattr(price, 'scrape_date', datetime.now())
+            )
+            db.add(record)
+            saved_count += 1
+        db.commit()
+        logger.info(f"✓ Saved {saved_count} records from {source_name}")
+    except Exception as e:
+        logger.error(f"✗ Error saving records from {source_name}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+    
+    return saved_count
+
+
 def demo_single_scraper():
     """Test a single scraper"""
     print("=" * 70)
     print("DEMO 1: Testing Individual Scrapers")
     print("=" * 70)
     
-    # Test Marjane (most likely to work with BeautifulSoup)
-    print("\n[1] Scraping Marjane for rice, oil, milk...")
-    marjane = MarjaneScraper()
-    marjane_prices = marjane.scrape_prices("rice, oil, milk")
-    
-    print(f"\nFound {len(marjane_prices)} prices from Marjane:")
-    for price in marjane_prices:
-        print(f"  • {price.product_name}: {price.price} {price.currency}")
-    
-    # Calculate average
-    if marjane_prices:
-        avg = calculate_average_price(marjane_prices)
-        print(f"\nAverage price: {avg['average']:.2f} MAD (Min: {avg['min']}, Max: {avg['max']})")
+    # Test Marjane (static HTML, most reliable)
+    print("\n[1] Scraping Marjane for 'rice, oil, milk'...")
+    try:
+        marjane = MarjaneScraper()
+        marjane_prices = marjane.scrape_prices("rice, oil, milk")
+        
+        print(f"\nFound {len(marjane_prices)} prices from Marjane:")
+        for price in marjane_prices:
+            print(f"  • {price.product_name}: {price.price} {getattr(price, 'currency', 'MAD')}")
+        
+        # Calculate average
+        if marjane_prices:
+            avg = calculate_average_price(marjane_prices)
+            print(f"\nAverage price: {avg['average']:.2f} MAD (Min: {avg['min']}, Max: {avg['max']})")
+    except Exception as e:
+        logger.error(f"Error with Marjane scraper: {e}")
+        print(f"  ✗ Error: {e}")
     
     print("\n" + "-" * 70)
     
-    # Test Carrefour
-    print("\n[2] Scraping Carrefour for rice, oil, milk...")
-    carrefour = CarrefourScraper()
-    carrefour_prices = carrefour.scrape_prices("rice, oil, milk")
-    
-    print(f"\nFound {len(carrefour_prices)} prices from Carrefour:")
-    for price in carrefour_prices:
-        print(f"  • {price.product_name}: {price.price} {price.currency}")
-    
-    if carrefour_prices:
-        avg = calculate_average_price(carrefour_prices)
-        print(f"\nAverage price: {avg['average']:.2f} MAD")
+    # Test Carrefour (refactored with Playwright + API fallback)
+    print("\n[2] Scraping Carrefour for 'rice, oil, milk'...")
+    try:
+        carrefour = CarrefourScraper()
+        carrefour_prices = carrefour.scrape_prices("rice, oil, milk")
+        
+        print(f"\nFound {len(carrefour_prices)} prices from Carrefour:")
+        for price in carrefour_prices:
+            print(f"  • {price.product_name}: {price.price} {getattr(price, 'currency', 'MAD')}")
+        
+        if carrefour_prices:
+            avg = calculate_average_price(carrefour_prices)
+            print(f"\nAverage price: {avg['average']:.2f} MAD")
+    except Exception as e:
+        logger.error(f"Error with Carrefour scraper: {e}")
+        print(f"  ✗ Error: {e}")
 
 
 def demo_all_scrapers():
@@ -79,12 +124,13 @@ def demo_all_scrapers():
     all_results = {}
     
     for scraper_name, scraper in scrapers.items():
-        print(f"\n[{scraper_name}] Fetching prices...")
+        print(f"\n[{scraper_name}] Fetching prices for '{', '.join(search_items)}'...")
         try:
             prices = scraper.scrape_prices(",".join(search_items))
             print(f"  ✓ Found {len(prices)} items")
             all_results[scraper_name] = prices
         except Exception as e:
+            logger.error(f"Error with {scraper_name}: {e}")
             print(f"  ✗ Error: {e}")
             all_results[scraper_name] = []
     
@@ -102,7 +148,7 @@ def demo_all_scrapers():
                     "Source": source_name,
                     "Product": price.product_name,
                     "Price (MAD)": price.price,
-                    "Date": price.scrape_date.strftime("%Y-%m-%d")
+                    "Date": getattr(price, 'scrape_date', datetime.now()).strftime("%Y-%m-%d") if hasattr(price, 'scrape_date') else datetime.now().strftime("%Y-%m-%d")
                 })
         
         if rows:
@@ -119,7 +165,7 @@ def demo_all_scrapers():
 
 
 def demo_save_to_database():
-    """Demonstrate saving prices to database"""
+    """Demonstrate saving prices from all scrapers to database"""
     print("\n" + "=" * 70)
     print("DEMO 3: Saving Scraped Data to Database")
     print("=" * 70)
@@ -127,38 +173,50 @@ def demo_save_to_database():
     # Initialize database
     print("\nInitializing database...")
     init_db()
+    print("✓ Database initialized")
     
-    # Scrape some data from Carrefour (most resilient with fallbacks)
-    print("Scraping Carrefour...")
-    scraper = CarrefourScraper()
-    prices = scraper.scrape_prices("rice, milk")
+    scrapers = {
+        "Marjane": MarjaneScraper(),
+        "Carrefour": CarrefourScraper(),
+        "Jumia Food": JumiaFoodScraper()
+    }
     
-    # Save to database
-    print(f"\nSaving {len(prices)} records to database...")
+    search_terms = "rice, milk"
+    total_saved = 0
+    
+    print(f"\n\nScraping and saving prices for: '{search_terms}'")
+    print("-" * 70)
+    
+    for scraper_name, scraper in scrapers.items():
+        print(f"\n[{scraper_name}] Scraping...")
+        try:
+            prices = scraper.scrape_prices(search_terms)
+            if prices:
+                saved = safe_save_to_db(prices, scraper_name)
+                total_saved += saved
+            else:
+                print(f"  (No prices found from {scraper_name})")
+        except Exception as e:
+            logger.error(f"Error scraping {scraper_name}: {e}")
+            print(f"  ✗ Error: {e}")
+    
+    # Display database contents
+    print("\n" + "-" * 70)
+    print("Database Summary")
+    print("-" * 70)
+    
     db = SessionLocal()
     try:
-        for price in prices:
-            record = PriceRecord(
-                product_name=price.product_name,
-                price=price.price,
-                currency=price.currency,
-                unit=price.unit,
-                source=price.source,
-                product_url=price.product_url,
-                scrape_date=price.scrape_date
-            )
-            db.add(record)
-        db.commit()
-        print(f"✓ {len(prices)} records saved successfully!")
-        
-        # Query and display
-        print("\nRetrieving records from database...")
         records = db.query(PriceRecord).all()
-        print(f"Total records in database: {len(records)}")
+        print(f"\nTotal records in database: {len(records)}")
         
-        for record in records[-3:]:  # Show last 3
-            print(f"  • {record.product_name} - {record.price} MAD (from {record.source})")
-            
+        if records:
+            print("\nLatest 10 records:")
+            for record in records[-10:]:
+                print(f"  • {record.product_name:<35} {record.price:>8.2f} {record.currency:<4} ({record.source})")
+    except Exception as e:
+        logger.error(f"Error querying database: {e}")
+        print(f"  ✗ Error: {e}")
     finally:
         db.close()
 
@@ -168,6 +226,7 @@ if __name__ == "__main__":
     print("╔" + "=" * 68 + "╗")
     print("║" + " " * 15 + "TRESORIER - WEB SCRAPING MODULE DEMO" + " " * 16 + "║")
     print("║" + " " * 20 + "Moroccan Food Price Scraper" + " " * 21 + "║")
+    print("║" + " " * 15 + "(Updated for new Carrefour & Jumia refactoring)" + " " * 2 + "║")
     print("╚" + "=" * 68 + "╝")
     
     try:
@@ -183,6 +242,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n⚠ Demo interrupted by user.")
     except Exception as e:
-        print(f"\n\n✗ Error: {e}")
+        logger.error(f"Critical error: {e}", exc_info=True)
+        print(f"\n\n✗ Critical Error: {e}")
         import traceback
         traceback.print_exc()
