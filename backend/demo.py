@@ -6,10 +6,25 @@ Run this to verify the scrapers work correctly with real Moroccan websites.
 
 import sys
 from datetime import datetime
-from app.scrapers import JumiaFoodScraper, MarjaneScraper, CarrefourScraper
+from app.scrapers import JumiaFoodScraper, MarjaneScraper
+from app.scrapers.carrefour_scraper import CarrefourScraper
 from app.database.models import PriceRecord
 from app.database.connection import init_db, SessionLocal
 import pandas as pd
+
+
+def calculate_average_price(prices):
+    """Helper function to calculate average price from a list of PriceData objects"""
+    if not prices:
+        return {"average": 0, "min": 0, "max": 0, "count": 0}
+    
+    price_list = [p.price for p in prices]
+    return {
+        "average": sum(price_list) / len(price_list),
+        "min": min(price_list),
+        "max": max(price_list),
+        "count": len(price_list),
+    }
 
 
 def demo_single_scraper():
@@ -29,7 +44,7 @@ def demo_single_scraper():
     
     # Calculate average
     if marjane_prices:
-        avg = marjane.calculate_average_price(marjane_prices)
+        avg = calculate_average_price(marjane_prices)
         print(f"\nAverage price: {avg['average']:.2f} MAD (Min: {avg['min']}, Max: {avg['max']})")
     
     print("\n" + "-" * 70)
@@ -44,7 +59,7 @@ def demo_single_scraper():
         print(f"  • {price.product_name}: {price.price} {price.currency}")
     
     if carrefour_prices:
-        avg = carrefour.calculate_average_price(carrefour_prices)
+        avg = calculate_average_price(carrefour_prices)
         print(f"\nAverage price: {avg['average']:.2f} MAD")
 
 
@@ -113,9 +128,9 @@ def demo_save_to_database():
     print("\nInitializing database...")
     init_db()
     
-    # Scrape some data
-    print("Scraping Marjane...")
-    scraper = MarjaneScraper()
+    # Scrape some data from Carrefour (most resilient with fallbacks)
+    print("Scraping Carrefour...")
+    scraper = CarrefourScraper()
     prices = scraper.scrape_prices("rice, milk")
     
     # Save to database

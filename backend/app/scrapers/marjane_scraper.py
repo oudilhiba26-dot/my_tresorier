@@ -10,8 +10,18 @@ from typing import List
 from datetime import datetime
 import logging
 import re
+import time
 
 from .base_scraper import BaseScraper, PriceData
+from .scraper_utils import (
+    create_session_with_retries,
+    retry_with_backoff,
+    get_fallback_mock_data,
+    categorize_request_error,
+    NetworkError,
+    AuthenticationError,
+    USER_AGENTS
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,9 +33,15 @@ class MarjaneScraper(BaseScraper):
     def __init__(self):
         super().__init__("Marjane")
         self.base_url = "https://www.marjane.ma"
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+        self.session = create_session_with_retries(retries=3, backoff_factor=0.5)
+        self.user_agent_index = 0
+        self.request_delay = 1.5  # Delay between requests to avoid 403 errors
+    
+    def _get_next_user_agent(self) -> str:
+        """Rotate through user agents to avoid blocking"""
+        ua = USER_AGENTS[self.user_agent_index % len(USER_AGENTS)]
+        self.user_agent_index += 1
+        return ua
     
     def scrape_prices(self, search_query: str = None) -> List[PriceData]:
         """
@@ -46,38 +62,103 @@ class MarjaneScraper(BaseScraper):
                 query = query.strip()
                 logger.info(f"Scraping Marjane for: {query}")
                 
-                # Construct search URL for Marjane
-                # Note: Actual URL structure may vary - adjust based on Marjane's current URL scheme
-                search_url = f"{self.base_url}/search?q={query}"
+                # Try real scraping first
+                prices = self._scrape_with_retry(query)
                 
-                try:
-                    response = requests.get(search_url, headers=self.headers, timeout=10)
-                    response.raise_for_status()
-                    
-                    soup = BeautifulSoup(response.content, "html.parser")
-                    
-                    # Find product containers (selectors need verification)
-                    # Marjane typically uses product cards with specific classes
-                    products = soup.find_all("div", class_="product")
-                    
-                    logger.info(f"Found {len(products)} products for '{query}'")
-                    
-                    for product in products[:5]:  # Limit to 5 results per query for demo
-                        try:
-                            price_data = self._extract_product_info(product, query)
-                            if price_data:
-                                all_prices.append(price_data)
-                        except Exception as e:
-                            logger.warning(f"Error extracting product info: {e}")
-                            
-                except requests.RequestException as e:
-                    logger.error(f"Request error for '{query}': {e}")
-                    
+                if prices:
+                    all_prices.extend(prices)
+                    logger.info(f"Successfully fetched {len(prices)} items from Marjane for '{query}'")
+                else:
+                    # Fall back to mock data if real scraping fails
+                    logger.warning(f"Real scraping failed for '{query}', using fallback data...")
+                    mock_prices = self._get_mock_prices(query)
+                    all_prices.extend(mock_prices)
+                    logger.info(f"Using {len(mock_prices)} fallback items for '{query}'")
+                
+                # Add delay between requests
+                time.sleep(self.request_delay)
+            
             return all_prices
             
         except Exception as e:
-            logger.error(f"Error in scrape_prices: {e}")
+            logger.error(f"Critical error in scrape_prices: {e}")
             return []
+    
+    def _scrape_with_retry(self, query: str) -> List[PriceData]:
+        """Attempt to scrape Marjane with retry logic"""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                headers = {"User-Agent": self._get_next_user_agent()}
+                search_url = f"{self.base_url}/search?q={query}"
+                
+                response = self.session.get(search_url, headers=headers, timeout=10)
+                
+                if response.status_code == 403:
+                    error_type = "AuthenticationError"
+                    logger.warning(f"[{error_type}] Got 403 Forbidden from Marjane")
+                    
+                    # Wait longer before retry for 403 errors
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)  # Exponential backoff
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    continue
+                
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.content, "html.parser")
+                products = soup.find_all("div", class_="product")
+                
+                logger.info(f"Found {len(products)} products for '{query}'")
+                
+                prices = []
+                for product in products[:5]:
+                    try:
+                        price_data = self._extract_product_info(product, query)
+                        if price_data:
+                            prices.append(price_data)
+                    except Exception as e:
+                        logger.debug(f"Error extracting product: {e}")
+                
+                return prices
+                
+            except requests.Timeout as e:
+                logger.warning(f"[NetworkError] Timeout on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.5 ** attempt)
+                    
+            except requests.ConnectionError as e:
+                logger.warning(f"[NetworkError] Connection error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.5 ** attempt)
+                    
+            except requests.RequestException as e:
+                error_type = categorize_request_error(e).__name__
+                logger.warning(f"[{error_type}] Request error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.5 ** attempt)
+        
+        return []
+    
+    def _get_mock_prices(self, query: str) -> List[PriceData]:
+        """Get fallback mock prices"""
+        mock_data = get_fallback_mock_data(query, self.source_name)
+        prices = []
+        
+        for product_name, price in mock_data:
+            prices.append(PriceData(
+                product_name=product_name,
+                price=price,
+                currency="MAD",
+                unit="piece",
+                source=f"{self.source_name} (Demo)",
+                scrape_date=datetime.now(),
+                product_url=""
+            ))
+        
+        return prices
     
     def _extract_product_info(self, product_element, product_type: str) -> PriceData:
         """
@@ -125,7 +206,8 @@ class MarjaneScraper(BaseScraper):
     def parse_product_page(self, url: str) -> PriceData:
         """Parse a single Marjane product page"""
         try:
-            response = requests.get(url, headers=self.headers, timeout=10)
+            headers = {"User-Agent": self._get_next_user_agent()}
+            response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, "html.parser")
@@ -144,6 +226,10 @@ class MarjaneScraper(BaseScraper):
                     scrape_date=datetime.now(),
                     product_url=url
                 )
+        except requests.Timeout:
+            logger.warning(f"Timeout parsing product page: {url}")
+        except requests.RequestException as e:
+            logger.warning(f"Error parsing product page: {e}")
         except Exception as e:
             logger.error(f"Error parsing product page: {e}")
         

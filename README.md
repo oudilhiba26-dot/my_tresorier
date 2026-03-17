@@ -63,7 +63,7 @@ my_tresorier/
 ```bash
 # Clone and navigate
 git clone https://github.com/oudilhiba26-dot/my_tresorier.git
-cd my_tresorier/backend
+
 
 # Create virtual environment (recommended)
 python -m venv venv
